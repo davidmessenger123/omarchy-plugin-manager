@@ -26,6 +26,9 @@ moves it afterwards if you change your mind.
     header ("N updates available")
   - Each stale row gains an **Update** button, and the header shows an
     **Update all** button, both running `omarchy plugin update`
+  - Row meta shows the installed commit (`@abc1234`), and in-menu notices
+    reflect the command's real exit code (success vs failed), so you can
+    verify that an update actually landed
 - **Marketplace** shortcut to https://plugins.omarchy.org/
 
 ## Keys

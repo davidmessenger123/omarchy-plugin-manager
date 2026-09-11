@@ -113,15 +113,18 @@ function fetchAll() {
 
   // ---- Git update checks -------------------------------------------------
 
-  // Compares the installed checkout's HEAD against its origin's HEAD,
-  // printing STALE (a newer commit exists) or UP-TO-DATE. Non-git folders or
-  // missing origins exit non-zero and map to "unknown" — no update UI.
+  // Compares the installed checkout's HEAD against its origin's HEAD. Prints
+  // two lines: "<short-sha>" then STALE (a newer commit exists) or
+  // UP-TO-DATE. Non-git folders or missing origins exit non-zero and map to
+  // "unknown" — no update UI, no SHA shown.
   readonly property string gitCheckScript:
     "dir=$1;"
-    + "localh=$(git -C \"$dir\" rev-parse HEAD 2>/dev/null) || exit 3;"
-    + "remoteh=$(git -C \"$dir\" ls-remote origin HEAD 2>/dev/null | cut -f1) || exit 4;"
-    + "[ -n \"$remoteh\" ] || exit 4;"
-    + "[ \"$remoteh\" = \"$localh\" ] && echo UP-TO-DATE || echo STALE"
+    + "full=$(git -C \"$dir\" rev-parse HEAD 2>/dev/null) || exit 3;"
+    + "short=$(git -C \"$dir\" rev-parse --short=7 HEAD 2>/dev/null) || exit 3;"
+    + "remote=$(git -C \"$dir\" ls-remote origin HEAD 2>/dev/null | cut -f1) || exit 4;"
+    + "[ -n \"$remote\" ] || exit 4;"
+    + "echo \"$short\";"
+    + "[ \"$remote\" = \"$full\" ] && echo UP-TO-DATE || echo STALE"
 
   function scheduleGitChecks() {
     for (var i = 0; i < root.allPlugins.length; i++) {
@@ -133,7 +136,7 @@ function fetchAll() {
 
   function enqueueGitCheck(id, dir) {
     if (root.gitInfo[id] !== undefined) return
-    root.gitInfo[id] = "checking"
+    root.gitInfo[id] = { "status": "checking", "sha": "" }
     root.gitChecks.push({ "id": id, "dir": dir })
     root.gitCheckNext()
   }
@@ -149,7 +152,8 @@ function fetchAll() {
   function updateCount() {
     var n = 0
     for (var i = 0; i < root.allPlugins.length; i++) {
-      if (root.gitInfo[root.allPlugins[i].id] === "stale") n++
+      var g = root.gitInfo[root.allPlugins[i].id]
+      if (g && g.status === "stale") n++
     }
     return n
   }
@@ -161,10 +165,13 @@ function fetchAll() {
       onStreamFinished: {
         var id = root.gitCurrentId
         root.gitCurrentId = ""
-        var out = String(text || "").trim()
-        if (out === "STALE") root.gitInfo[id] = "stale"
-        else if (out === "UP-TO-DATE") root.gitInfo[id] = "current"
-        else root.gitInfo[id] = "unknown"
+        var lines = String(text || "").trim().split("\n")
+        var sha = lines.length > 0 ? lines[0].trim() : ""
+        var status = lines.length > 1 ? lines[1].trim() : ""
+        if (status === "STALE") status = "stale"
+        else if (status === "UP-TO-DATE") status = "current"
+        else { status = "unknown"; sha = "" }
+        root.gitInfo[id] = { "status": status, "sha": sha }
         root.gitCheckNext()
       }
     }
@@ -248,25 +255,19 @@ function fetchAll() {
     id: actionProc
     property string _successMsg: ""
     property string _failMsg: ""
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.onActionFinished(_successMsg, _failMsg)
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.onActionFinished(_successMsg, _failMsg)
+    // The exit code is the ground truth — an action may print nothing yet
+    // still fail (offline, local edits blocking a fast-forward, invalid repo).
+    onExited: function(exitCode) {
+      root.finishAction(exitCode === 0 ? root.actionProc._successMsg : root.actionProc._failMsg)
     }
   }
 
-  function onActionFinished(successMsg, failMsg) {
-    var wasBusy = false
+  function finishAction(msg) {
+    var hasBusy = false
     for (var id in root.busy) {
-      if (root.busy[id]) { wasBusy = true; root.busy[id] = false }
+      if (root.busy[id]) { hasBusy = true; root.busy[id] = false }
     }
-    // Command success is implied by exit; the completed-read just marks the
-    // moment it stopped. Best effort: refresh the list so state reflects the
-    // shell's new plugin set.
-    root.setNotice(successMsg)
+    root.setNotice(msg)
     Qt.callLater(function() { root.refresh() })
   }
 
@@ -611,11 +612,12 @@ delegate: Item {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(4)
-                  visible: row.canToggle || row.canConfigure || row.canRemove || root.gitInfo[row.id] === "stale"
+                  visible: row.canToggle || row.canConfigure || row.canRemove
+                    || (root.gitInfo[row.id] && root.gitInfo[row.id].status === "stale")
 
                   PanelActionButton {
                     id: updateBtn
-                    visible: root.gitInfo[row.id] === "stale" && !row.firstParty
+                    visible: root.gitInfo[row.id] && root.gitInfo[row.id].status === "stale" && !row.firstParty
                     iconText: "\uf01e"
                     tooltipText: "Update " + row.name
                     foreground: Color.accent
@@ -746,8 +748,12 @@ delegate: Item {
     if (row.hasSchema) parts.push("configurable")
     if (row.clonedFrom) parts.push("clone of " + row.clonedFrom)
     if (!row.enabled) parts.push("disabled")
-    if (root.gitInfo[row.id] === "stale") parts.push("update available")
-    if (root.gitInfo[row.id] === "checking") parts.push("checking…")
+    var g = root.gitInfo[row.id]
+    if (g) {
+      if (g.status === "stale") parts.push("update available")
+      if (g.status === "checking") parts.push("checking…")
+      if (g.sha) parts.push("@" + g.sha)
+    }
     if (root.rowBusy(row.id)) parts.push("working…")
     return parts.join("  ·  ")
   }
