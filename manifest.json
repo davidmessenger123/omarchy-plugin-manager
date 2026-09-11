@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "davidjm.plugin-manager",
+  "name": "Plugin Manager",
+  "version": "1.0.0",
+  "author": "davidjm",
+  "license": "MIT",
+  "description": "Manage installed Omarchy shell plugins from the bar: enable, disable, uninstall, configure, and open the plugin marketplace.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "PluginManager.qml"
+  },
+  "barWidget": {
+    "displayName": "Plugin Manager",
+    "description": "Enable, disable, uninstall or configure shell plugins, with a shortcut to the plugin marketplace.",
+    "category": "System",
+    "allowMultiple": false
+  }
+}
