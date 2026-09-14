@@ -760,20 +760,23 @@ delegate: Item {
 
           Button {
             id: updateAllFooter
-            visible: root.updateCount() > 0
-            text: root.updateCount() > 1
-              ? "Update all (" + root.updateCount() + ")"
-              : "Update all"
+            text: root.updateCount() > 0
+              ? (root.updateCount() > 1
+                  ? "Update all (" + root.updateCount() + ")"
+                  : "Update all")
+              : "Up to date"
             iconText: "\uf01e"
-            foreground: Color.accent
+            foreground: root.updateCount() > 0 ? Color.accent : Qt.darker(root.bar.foreground, 1.4)
             accent: Color.accent
             iconSize: Style.font.caption
             fontSize: Style.font.caption
             fontFamily: root.bar.fontFamily
             horizontalPadding: Style.space(10)
             verticalPadding: Style.space(4)
-            tooltipText: "Update all " + root.updateCount() + " stale plugin" + (root.updateCount() > 1 ? "s" : "")
-            enabled: !root.busy["*"] && !root.loading
+            tooltipText: root.updateCount() > 0
+              ? "Update all " + root.updateCount() + " stale plugin" + (root.updateCount() > 1 ? "s" : "")
+              : "All plugins are up to date"
+            enabled: root.updateCount() > 0 && !root.busy["*"] && !root.loading
             iconSpinning: root.busy["*"] === true
             onClicked: root.updateAll()
           }
