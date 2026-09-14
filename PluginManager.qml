@@ -113,18 +113,56 @@ function fetchAll() {
 
   // ---- Git update checks -------------------------------------------------
 
-  // Compares the installed checkout's HEAD against its origin's HEAD. Prints
-  // two lines: "<short-sha>" then STALE (a newer commit exists) or
-  // UP-TO-DATE. Non-git folders or missing origins exit non-zero and map to
-  // "unknown" — no update UI, no SHA shown.
+  // Classifies the installed checkout against its origin. Fetches once (like
+  // `omarchy plugin update` itself), then prints lines:
+  //   <short-sha>
+  //   STALE | UP-TO-DATE | DIRTY | DIVERGED
+  //   <reason for blocked states>   (optional third line)
+  // STALE means a clean fast-forward is possible, so an update button is
+  // shown. DIRTY (uncommitted edits) and DIVERGED (unpublished commits) mean
+  // the update cannot fast-forward, so no update is offered; the reason is
+  // shown in the row meta. Fetch/rev failures exit non-zero → "unknown", no
+  // update UI, no SHA shown.
   readonly property string gitCheckScript:
     "dir=$1;"
+    + "git -C \"$dir\" fetch --quiet origin HEAD 2>/dev/null || exit 4;"
     + "full=$(git -C \"$dir\" rev-parse HEAD 2>/dev/null) || exit 3;"
     + "short=$(git -C \"$dir\" rev-parse --short=7 HEAD 2>/dev/null) || exit 3;"
-    + "remote=$(git -C \"$dir\" ls-remote origin HEAD 2>/dev/null | cut -f1) || exit 4;"
-    + "[ -n \"$remote\" ] || exit 4;"
-    + "echo \"$short\";"
-    + "[ \"$remote\" = \"$full\" ] && echo UP-TO-DATE || echo STALE"
+    + "fetched=$(git -C \"$dir\" rev-parse FETCH_HEAD 2>/dev/null) || exit 4;"
+    + "[ \"$fetched\" = \"$full\" ] && { echo \"$short\"; echo UP-TO-DATE; exit 0; };"
+    + "git -C \"$dir\" merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null || { echo \"$short\"; echo DIVERGED; echo \"unpublished commits\"; exit 0; };"
+    + "[ -n \"$(git -C \"$dir\" status --porcelain 2>/dev/null)\" ] && { echo \"$short\"; echo DIRTY; echo \"local changes\"; exit 0; };"
+    + "echo \"$short\"; echo STALE"
+
+  // QML only notifies bindings when a var property is *reassigned*, not when
+  // its members are mutated. All gitInfo/busy writes go through these helpers
+  // so the count, the update dot and every row button update live.
+  function gitState(id) {
+    var g = root.gitInfo[id]
+    return g ? String(g.status) : ""
+  }
+
+  function setGitStatus(id, status, sha, reason) {
+    var next = {}
+    for (var key in root.gitInfo) next[key] = root.gitInfo[key]
+    next[id] = { "status": status, "sha": sha, "reason": String(reason || "") }
+    root.gitInfo = next
+  }
+
+  function clearGitStatus(id) {
+    if (root.gitInfo[id] === undefined) return
+    var next = {}
+    for (var key in root.gitInfo) if (key !== id) next[key] = root.gitInfo[key]
+    root.gitInfo = next
+  }
+
+  function setBusy(id, value) {
+    var next = {}
+    for (var key in root.busy) next[key] = root.busy[key]
+    if (value === true) next[id] = true
+    else delete next[id]
+    root.busy = next
+  }
 
   function scheduleGitChecks() {
     for (var i = 0; i < root.allPlugins.length; i++) {
@@ -136,7 +174,7 @@ function fetchAll() {
 
   function enqueueGitCheck(id, dir) {
     if (root.gitInfo[id] !== undefined) return
-    root.gitInfo[id] = { "status": "checking", "sha": "" }
+    root.setGitStatus(id, "checking", "", "")
     root.gitChecks.push({ "id": id, "dir": dir })
     root.gitCheckNext()
   }
@@ -168,10 +206,12 @@ function fetchAll() {
         var lines = String(text || "").trim().split("\n")
         var sha = lines.length > 0 ? lines[0].trim() : ""
         var status = lines.length > 1 ? lines[1].trim() : ""
+        var reason = lines.length > 2 ? lines[2].trim() : ""
         if (status === "STALE") status = "stale"
         else if (status === "UP-TO-DATE") status = "current"
-        else { status = "unknown"; sha = "" }
-        root.gitInfo[id] = { "status": status, "sha": sha }
+        else if (status === "DIRTY" || status === "DIVERGED") status = "blocked"
+        else { status = "unknown"; sha = ""; reason = "" }
+        root.setGitStatus(id, status, sha, reason)
         root.gitCheckNext()
       }
     }
@@ -188,7 +228,7 @@ function fetchAll() {
     if (root.allPlugins.length > 0 && root.rowById(id)) {
       var entry = root.rowById(id)
       if (entry.isBar) return
-      root.busy[id] = true
+      root.setBusy(id, true)
     }
     actionProc.command = command
     actionProc._successMsg = successMsg
@@ -197,31 +237,32 @@ function fetchAll() {
   }
 
   function toggleRow(row) {
-    if (!row || row.isBar || root.rowBusy(row.id)) return
+    if (!row || row.isBar || root.rowBusy(row.id) || root.busy["*"]) return
     if (row.enabled) root.runPluginsCommand(PM.disableCommand(row.id), "Disabled " + row.name, "Failed to disable " + row.name)
     else root.runPluginsCommand(PM.enableCommand(row.id), "Enabled " + row.name, "Failed to enable " + row.name)
   }
 
   function removeRow(row) {
-    if (!row || !row.canRemove || root.rowBusy(row.id)) return
+    if (!row || !row.canRemove || root.rowBusy(row.id) || root.busy["*"]) return
     root.runPluginsCommand(PM.removeCommand(row.id), "Removed " + row.name, "Failed to remove " + row.name, row.id)
   }
 
   function updateRow(row) {
     if (!row || row.firstParty || root.rowBusy(row.id) || root.busy["*"]) return
-    delete root.gitInfo[row.id]
+    root.clearGitStatus(row.id)
     root.runPluginsCommand(PM.updateCommand(row.id), "Updated " + row.name, "Failed to update " + row.name, row.id)
   }
 
   function updateAll() {
     if (root.busy["*"]) return
-    root.busy["*"] = true
+    for (var id in root.busy) if (root.busy[id] === true) return
+    root.setBusy("*", true)
     root.gitInfo = {}
     root.gitChecks = []
     root.gitCurrentId = ""
     actionProc.command = PM.updateAllCommand()
     actionProc._successMsg = "Updated all plugins"
-    actionProc._failMsg = "Failed to update plugins"
+    actionProc._failMsg = "Failed to update some plugins"
     actionProc.running = true
   }
 
@@ -263,10 +304,7 @@ function fetchAll() {
   }
 
   function finishAction(msg) {
-    var hasBusy = false
-    for (var id in root.busy) {
-      if (root.busy[id]) { hasBusy = true; root.busy[id] = false }
-    }
+    root.busy = {}
     root.setNotice(msg)
     Qt.callLater(function() { root.refresh() })
   }
@@ -613,11 +651,11 @@ delegate: Item {
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(4)
                   visible: row.canToggle || row.canConfigure || row.canRemove
-                    || (root.gitInfo[row.id] && root.gitInfo[row.id].status === "stale")
+                    || root.gitState(row.id) === "stale"
 
                   PanelActionButton {
                     id: updateBtn
-                    visible: root.gitInfo[row.id] && root.gitInfo[row.id].status === "stale" && !row.firstParty
+                    visible: root.gitState(row.id) === "stale" && !row.firstParty
                     iconText: "\uf01e"
                     tooltipText: "Update " + row.name
                     foreground: Color.accent
@@ -715,15 +753,40 @@ delegate: Item {
         }
 
         // ---------- Footer ----------
-        Text {
+        Column {
           visible: root.allPlugins.length > 0
           width: parent.width
-          textFormat: Text.PlainText
-          text: "  /  search   ·   enter  toggle   ·   c  configure   ·   u  update   ·   del  remove   ·   m  marketplace"
-          color: Qt.darker(root.bar.foreground, 1.7)
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
+          spacing: Style.space(6)
+
+          Button {
+            id: updateAllFooter
+            visible: root.updateCount() > 0
+            text: root.updateCount() > 1
+              ? "Update all (" + root.updateCount() + ")"
+              : "Update all"
+            iconText: "\uf01e"
+            foreground: Color.accent
+            accent: Color.accent
+            iconSize: Style.font.caption
+            fontSize: Style.font.caption
+            fontFamily: root.bar.fontFamily
+            horizontalPadding: Style.space(10)
+            verticalPadding: Style.space(4)
+            tooltipText: "Update all " + root.updateCount() + " stale plugin" + (root.updateCount() > 1 ? "s" : "")
+            enabled: !root.busy["*"] && !root.loading
+            iconSpinning: root.busy["*"] === true
+            onClicked: root.updateAll()
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "  /  search   ·   enter  toggle   ·   c  configure   ·   u  update   ·   del  remove   ·   m  marketplace"
+            color: Qt.darker(root.bar.foreground, 1.7)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
         }
       }
     }
@@ -751,7 +814,8 @@ delegate: Item {
     var g = root.gitInfo[row.id]
     if (g) {
       if (g.status === "stale") parts.push("update available")
-      if (g.status === "checking") parts.push("checking…")
+      else if (g.status === "blocked") parts.push("no update · " + (g.reason || "has local edits"))
+      else if (g.status === "checking") parts.push("checking…")
       if (g.sha) parts.push("@" + g.sha)
     }
     if (root.rowBusy(row.id)) parts.push("working…")
