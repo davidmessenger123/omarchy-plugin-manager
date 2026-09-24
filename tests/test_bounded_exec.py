@@ -28,7 +28,12 @@ class BoundedExecTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertLessEqual(len(result.stdout), 32)
 
-    def test_resolver_rejects_user_shim_for_named_command(self):
+    def test_child_environment_preserves_omarchy_runtime_path(self):
+        import bounded_exec
+        with mock.patch.dict(os.environ, {"OMARCHY_PATH": "/tmp/untrusted"}, clear=False):
+            environment = bounded_exec.child_environment()
+        self.assertEqual(environment["OMARCHY_PATH"], "/usr/share/omarchy")
+
         import bounded_exec
         with mock.patch.dict(os.environ, {"PATH": "/tmp"}):
             self.assertIsNone(bounded_exec.resolve_executable("definitely-not-a-system-command"))

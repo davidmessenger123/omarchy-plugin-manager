@@ -41,7 +41,12 @@ def resolve_executable(value):
 
 
 def child_environment():
-    env = {"PATH": SYSTEM_PATH, "LANG": "C", "LC_ALL": "C"}
+    env = {
+        "PATH": SYSTEM_PATH,
+        "LANG": "C",
+        "LC_ALL": "C",
+        "OMARCHY_PATH": "/usr/share/omarchy",
+    }
     for name in ("HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR"):
         value = os.environ.get(name, "")
         if value and len(value) <= 4096 and "\x00" not in value and "\r" not in value and "\n" not in value:
