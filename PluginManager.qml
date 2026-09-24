@@ -23,20 +23,36 @@ Panel {
   // ---- State -------------------------------------------------------------
   property var allPlugins: []
   property var rows: []
-  property var listRaw: null
-  property var catalogRaw: null
+  property var listGood: null
+  property var catalogGood: null
   property string query: ""
   property bool loading: false
   property string notice: ""
   property var busy: ({})
   property int cursorIndex: -1
+  property int dataGeneration: 0
+  property int listGeneration: -1
+  property int catalogGeneration: -1
+  property bool listReady: false
+  property bool catalogReady: false
+  property bool dataPending: false
+  property bool refreshQueued: false
+  property var lastGoodRows: []
+  property bool gitChecksRequested: false
+  property string pendingRemovalId: ""
+  property string pendingRemovalName: ""
+  property int actionGeneration: 0
+  property bool actionRunning: false
 
-  // Per-plugin git status: id -> "checking" | "current" | "stale" | "unknown".
-  // "stale" means the installed checkout is behind its origin, i.e. an update
-  // is available for that plugin.
   property var gitInfo: ({})
   property var gitChecks: []
   property string gitCurrentId: ""
+  property int updatesAvailable: 0
+  property int gitGeneration: 0
+  property bool gitTimedOut: false
+  property bool gitPending: false
+  property string lastActionId: ""
+  property bool lastActionNeedsGitRecheck: false
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string iconText: "\uf1b3"
@@ -54,30 +70,169 @@ Panel {
 
   // ---- Data loading ------------------------------------------------------
   function reconcile() {
-    if (root.listRaw === null || root.catalogRaw === null) return
-    root.allPlugins = PM.merge(PM.parseList(root.listRaw), PM.parseCatalog(root.catalogRaw))
+    if (!root.listReady || !root.catalogReady || root.listGood === null || root.catalogGood === null) return
+    root.allPlugins = PM.merge(root.listGood, root.catalogGood)
+    root.lastGoodRows = root.allPlugins.slice(0)
     root.rows = PM.applyFilter(root.allPlugins, root.query)
     root.loading = false
     if (root.cursorIndex >= root.rows.length) root.cursorIndex = root.rows.length - 1
-    root.scheduleGitChecks()
+    root.recomputeUpdatesAvailable()
+    if (root.gitChecksRequested) root.scheduleGitChecks()
   }
 
-  function refresh() {
-    root.listRaw = null
-    root.catalogRaw = null
-    root.loading = true
-    root.notice = ""
-    root.gitInfo = {}
-    root.gitChecks = []
-    root.gitCurrentId = ""
+  function stopDataProcesses() {
+    root.dataPending = true
+    root.listGeneration = -1
+    root.catalogGeneration = -1
     listProc.running = false
     catalogProc.running = false
+    dataTimeout.stop()
+  }
+
+  function startDataGeneration() {
+    if (!root.dataPending) return
+    if (listProc.running || catalogProc.running) {
+      dataRestartTimer.restart()
+      return
+    }
+    root.dataPending = false
+    var generation = ++root.dataGeneration
+    root.listGeneration = generation
+    root.catalogGeneration = generation
+    root.listReady = false
+    root.catalogReady = false
+    root.loading = true
+    listProc.generation = generation
+    catalogProc.generation = generation
+    listProc.output = ""
+    catalogProc.output = ""
+    listProc.overflow = false
+    catalogProc.overflow = false
+    listProc.timedOut = false
+    catalogProc.timedOut = false
     Qt.callLater(fetchAll)
   }
 
-function fetchAll() {
-    if (!listProc.running) listProc.running = true
-    if (!catalogProc.running) catalogProc.running = true
+  function beginDataFetch() {
+    stopDataProcesses()
+    root.listReady = false
+    root.catalogReady = false
+    root.loading = true
+    dataRestartTimer.restart()
+  }
+
+  function flushRefresh() {
+    if (!root.refreshQueued) return
+    root.refreshQueued = false
+    if (root.loading || root.dataPending || root.actionRunning) {
+      root.refreshQueued = true
+      return
+    }
+    root.beginDataFetch()
+  }
+
+  function refresh() {
+    root.notice = ""
+    root.gitChecksRequested = false
+    root.gitInfo = {}
+    root.updatesAvailable = 0
+    root.stopGitChecks()
+    if (root.loading || root.dataPending || root.actionRunning) {
+      root.refreshQueued = true
+      return
+    }
+    root.beginDataFetch()
+  }
+
+  function softRefresh() {
+    if (root.loading || root.dataPending || root.actionRunning) {
+      root.refreshQueued = true
+      return
+    }
+    root.beginDataFetch()
+  }
+
+  function queueRefresh() {
+    if (root.refreshQueued) return
+    root.refreshQueued = true
+    Qt.callLater(root.flushRefresh)
+  }
+
+  function collectData(proc, chunk) {
+    if (proc.overflow) return
+    var value = String(chunk || "")
+    if (proc.output.length + value.length > PM.MAX_DATA_BYTES) {
+      proc.overflow = true
+      proc.output = ""
+      proc.running = false
+      return
+    }
+    proc.output += value + "\n"
+  }
+
+  function boundedCommand(command, maximum, timeout) {
+    if (!PM.validExternalCommand(command) || root.pluginDir === "") return []
+    return ["/usr/bin/python3", "-I", root.pluginDir + "/bounded_exec.py", "run",
+      "--max-output", String(maximum), "--timeout", String(timeout), "--"].concat(command)
+  }
+
+  function finishData(kind, exitCode) {
+    var proc = kind === "list" ? listProc : catalogProc
+    if (proc.generation !== root.dataGeneration) {
+      if (!listProc.running && !catalogProc.running && root.dataPending) {
+        dataRestartTimer.restart()
+      }
+      return
+    }
+    var body = String(proc.output || "")
+    var valid = exitCode === 0 && !proc.overflow && !proc.timedOut
+    var parsed = valid ? (kind === "list" ? PM.parseListResult(body) : PM.parseCatalogResult(body)) : null
+    if (parsed && parsed.ok) {
+      if (kind === "list") {
+        root.listGood = parsed.data
+        root.listReady = true
+      } else {
+        root.catalogGood = parsed.data
+        root.catalogReady = true
+      }
+      root.reconcile()
+    } else if (proc.timedOut) {
+      root.setNotice(kind === "list" ? "Plugin list timed out" : "Plugin catalog timed out")
+    } else {
+      root.setNotice(kind === "list" ? "Plugin list unavailable" : "Plugin catalog unavailable")
+    }
+    proc.output = ""
+    proc.overflow = false
+    proc.timedOut = false
+    if (!listProc.running && !catalogProc.running && root.dataPending) {
+      dataRestartTimer.restart()
+    } else if (!listProc.running && !catalogProc.running && (!root.listReady || !root.catalogReady)) {
+      root.loading = false
+    }
+    if (!root.loading && !root.dataPending && root.refreshQueued)
+      Qt.callLater(root.flushRefresh)
+  }
+
+  function fetchAll() {
+    if (root.dataPending || root.listGeneration !== root.dataGeneration || root.catalogGeneration !== root.dataGeneration) return
+    var listCommand = root.boundedCommand(PM.listCommand(), PM.MAX_DATA_BYTES, 15)
+    var catalogCommand = root.boundedCommand(PM.catalogCommand(), PM.MAX_DATA_BYTES, 15)
+    if (listCommand.length === 0 || catalogCommand.length === 0) {
+      root.listReady = false
+      root.catalogReady = false
+      root.loading = false
+      root.setNotice("Plugin commands are unavailable")
+      return
+    }
+    if (!listProc.running) {
+      listProc.command = listCommand
+      listProc.running = true
+    }
+    if (!catalogProc.running) {
+      catalogProc.command = catalogCommand
+      catalogProc.running = true
+    }
+    dataTimeout.restart()
   }
 
   function rowById(id) {
@@ -89,64 +244,88 @@ function fetchAll() {
 
   Process {
     id: listProc
-    command: PM.listCommand()
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.listRaw = text
-        root.reconcile()
-      }
+    property int generation: -1
+    property string output: ""
+    property bool overflow: false
+    property bool timedOut: false
+    command: []
+    stdout: SplitParser {
+      onRead: function(data) { root.collectData(listProc, data) }
     }
+    stderr: SplitParser {}
+    onExited: function(exitCode) { root.finishData("list", exitCode) }
   }
 
   Process {
     id: catalogProc
-    command: PM.catalogCommand()
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.catalogRaw = text
-        root.reconcile()
+    property int generation: -1
+    property string output: ""
+    property bool overflow: false
+    property bool timedOut: false
+    command: []
+    stdout: SplitParser {
+      onRead: function(data) { root.collectData(catalogProc, data) }
+    }
+    stderr: SplitParser {}
+    onExited: function(exitCode) { root.finishData("catalog", exitCode) }
+  }
+
+  Timer {
+    id: dataRestartTimer
+    interval: 100
+    repeat: false
+    onTriggered: root.startDataGeneration()
+  }
+
+  Timer {
+    id: dataTimeout
+    interval: 10000
+    repeat: false
+    onTriggered: {
+      if (listProc.running) {
+        listProc.timedOut = true
+        listProc.signal(15)
+        listProc.running = false
+      }
+      if (catalogProc.running) {
+        catalogProc.timedOut = true
+        catalogProc.signal(15)
+        catalogProc.running = false
+      }
+      if (root.dataGeneration > 0 && (!listProc.running || !catalogProc.running)) {
+        root.dataPending = true
+        root.listGeneration = -1
+        root.catalogGeneration = -1
+        dataRestartTimer.restart()
       }
     }
   }
 
   // ---- Git update checks -------------------------------------------------
 
-  // Classifies the installed checkout against its origin. Fetches once (like
-  // `omarchy plugin update` itself), then prints lines:
-  //   <short-sha>
-  //   STALE | UP-TO-DATE | DIRTY | DIVERGED
-  //   <reason for blocked states>   (optional third line)
-  // STALE means a clean fast-forward is possible, so an update button is
-  // shown. DIRTY (uncommitted edits) and DIVERGED (unpublished commits) mean
-  // the update cannot fast-forward, so no update is offered; the reason is
-  // shown in the row meta. Fetch/rev failures exit non-zero → "unknown", no
-  // update UI, no SHA shown.
-  readonly property string gitCheckScript:
-    "dir=$1;"
-    + "git -C \"$dir\" fetch --quiet origin HEAD 2>/dev/null || exit 4;"
-    + "full=$(git -C \"$dir\" rev-parse HEAD 2>/dev/null) || exit 3;"
-    + "short=$(git -C \"$dir\" rev-parse --short=7 HEAD 2>/dev/null) || exit 3;"
-    + "fetched=$(git -C \"$dir\" rev-parse FETCH_HEAD 2>/dev/null) || exit 4;"
-    + "[ \"$fetched\" = \"$full\" ] && { echo \"$short\"; echo UP-TO-DATE; exit 0; };"
-    + "git -C \"$dir\" merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null || { echo \"$short\"; echo DIVERGED; echo \"unpublished commits\"; exit 0; };"
-    + "[ -n \"$(git -C \"$dir\" status --porcelain 2>/dev/null)\" ] && { echo \"$short\"; echo DIRTY; echo \"local changes\"; exit 0; };"
-    + "echo \"$short\"; echo STALE"
+  readonly property string pluginDir: PM.scriptPath(String(Qt.resolvedUrl(".")))
 
-  // QML only notifies bindings when a var property is *reassigned*, not when
-  // its members are mutated. All gitInfo/busy writes go through these helpers
-  // so the count, the update dot and every row button update live.
   function gitState(id) {
     var g = root.gitInfo[id]
     return g ? String(g.status) : ""
   }
 
+  function recomputeUpdatesAvailable() {
+    var n = 0
+    for (var i = 0; i < root.allPlugins.length; i++) {
+      var g = root.gitInfo[root.allPlugins[i].id]
+      if (g && g.status === "stale") n++
+    }
+    root.updatesAvailable = n
+  }
+
   function setGitStatus(id, status, sha, reason) {
+    if (!PM.validPluginId(id)) return
     var next = {}
     for (var key in root.gitInfo) next[key] = root.gitInfo[key]
-    next[id] = { "status": status, "sha": sha, "reason": String(reason || "") }
+    next[id] = { "status": String(status || "unknown"), "sha": String(sha || ""), "reason": String(reason || "") }
     root.gitInfo = next
+    root.recomputeUpdatesAvailable()
   }
 
   function clearGitStatus(id) {
@@ -154,6 +333,7 @@ function fetchAll() {
     var next = {}
     for (var key in root.gitInfo) if (key !== id) next[key] = root.gitInfo[key]
     root.gitInfo = next
+    root.recomputeUpdatesAvailable()
   }
 
   function setBusy(id, value) {
@@ -164,56 +344,167 @@ function fetchAll() {
     root.busy = next
   }
 
+  function stopGitChecks() {
+    root.gitGeneration++
+    root.gitPending = true
+    gitCheckProc.running = false
+    gitTimeout.stop()
+    root.gitChecks = []
+    root.gitCurrentId = ""
+    gitRestartTimer.restart()
+  }
+
+  function requestGitChecks() {
+    root.gitChecksRequested = true
+    root.gitInfo = {}
+    root.updatesAvailable = 0
+    root.stopGitChecks()
+    if (root.loading || root.allPlugins.length === 0) {
+      root.setNotice("Open the panel to check for updates")
+      return
+    }
+    root.scheduleGitChecks()
+  }
+
   function scheduleGitChecks() {
+    if (!root.gitChecksRequested) return
     for (var i = 0; i < root.allPlugins.length; i++) {
       var p = root.allPlugins[i]
-      if (p.firstParty || !p.sourceDir) continue
+      if (p.firstParty || !p.sourceDir || !PM.validPath(p.sourceDir)) continue
       root.enqueueGitCheck(p.id, String(p.sourceDir))
     }
   }
 
   function enqueueGitCheck(id, dir) {
-    if (root.gitInfo[id] !== undefined) return
+    if (!PM.validPluginId(id) || !PM.validPath(dir) || root.gitInfo[id] !== undefined) return
+    if (root.gitChecks.length >= PM.MAX_GIT_CHECKS) {
+      root.setGitStatus(id, "unknown", "", "queue limit")
+      return
+    }
     root.setGitStatus(id, "checking", "", "")
-    root.gitChecks.push({ "id": id, "dir": dir })
+    var queue = root.gitChecks.slice(0)
+    queue.push({ "id": String(id), "dir": String(dir) })
+    root.gitChecks = queue
     root.gitCheckNext()
   }
 
-  function gitCheckNext() {
-    if (root.gitCurrentId !== "" || root.gitChecks.length === 0) return
-    var job = root.gitChecks.shift()
-    root.gitCurrentId = job.id
-    gitCheckProc.command = ["bash", "-c", root.gitCheckScript, "check", job.dir]
-    gitCheckProc.running = true
+  function collectGit(data) {
+    if (gitCheckProc.overflow) return
+    var value = String(data || "")
+    if (gitCheckProc.output.length + value.length > 4096) {
+      gitCheckProc.overflow = true
+      gitCheckProc.output = ""
+      gitCheckProc.signal(15)
+      gitCheckProc.running = false
+      if (root.gitCurrentId) {
+        root.setGitStatus(root.gitCurrentId, "unknown", "", "")
+        root.gitCurrentId = ""
+      }
+      gitRestartTimer.restart()
+      return
+    }
+    gitCheckProc.output += value + "\n"
   }
 
-  function updateCount() {
-    var n = 0
-    for (var i = 0; i < root.allPlugins.length; i++) {
-      var g = root.gitInfo[root.allPlugins[i].id]
-      if (g && g.status === "stale") n++
+  function gitCheckNext() {
+    if (root.gitPending) {
+      gitRestartTimer.restart()
+      return
     }
-    return n
+    if (root.gitCurrentId !== "" || root.gitChecks.length === 0) return
+    var queue = root.gitChecks.slice(0)
+    var job = queue.shift()
+    root.gitChecks = queue
+    root.gitCurrentId = job.id
+    var generation = ++root.gitGeneration
+    gitCheckProc.generation = generation
+    gitCheckProc.output = ""
+    gitCheckProc.overflow = false
+    gitCheckProc.timedOut = false
+    var command = root.boundedCommand([
+      "/usr/bin/python3", "-I", root.pluginDir + "/git_check.py", String(job.dir)
+    ], 8192, 20)
+    if (command.length === 0) {
+      root.setGitStatus(job.id, "unknown", "", "helper unavailable")
+      root.gitCurrentId = ""
+      root.gitCheckNext()
+      return
+    }
+    gitCheckProc.command = command
+    gitCheckProc.running = true
+    gitTimeout.restart()
   }
 
   Process {
     id: gitCheckProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var id = root.gitCurrentId
-        root.gitCurrentId = ""
-        var lines = String(text || "").trim().split("\n")
-        var sha = lines.length > 0 ? lines[0].trim() : ""
-        var status = lines.length > 1 ? lines[1].trim() : ""
-        var reason = lines.length > 2 ? lines[2].trim() : ""
-        if (status === "STALE") status = "stale"
-        else if (status === "UP-TO-DATE") status = "current"
-        else if (status === "DIRTY" || status === "DIVERGED") status = "blocked"
-        else { status = "unknown"; sha = ""; reason = "" }
-        root.setGitStatus(id, status, sha, reason)
-        root.gitCheckNext()
+    property int generation: -1
+    property string output: ""
+    property bool overflow: false
+    property bool timedOut: false
+    command: []
+    stdout: SplitParser {
+      onRead: function(data) { root.collectGit(data) }
+    }
+    stderr: SplitParser {}
+    onExited: function(exitCode) {
+      if (gitCheckProc.generation !== root.gitGeneration) {
+        if (!gitCheckProc.running) gitRestartTimer.restart()
+        return
       }
+      gitTimeout.stop()
+      var id = root.gitCurrentId
+      if (!id) return
+      root.gitCurrentId = ""
+      var body = String(gitCheckProc.output || "")
+      var lines = body.trim().split("\n").filter(function(line) { return line.trim() !== "" })
+      var sha = lines.length > 0 ? lines[0].trim() : ""
+      var status = lines.length > 1 ? lines[1].trim() : ""
+      var reason = lines.length > 2 ? lines[2].trim() : ""
+      if (gitCheckProc.overflow || gitCheckProc.timedOut || exitCode !== 0) {
+        status = "unknown"
+        sha = ""
+        reason = ""
+      } else if (status === "STALE") status = "stale"
+      else if (status === "UP-TO-DATE") status = "current"
+      else if (status === "DIRTY" || status === "DIVERGED") status = "blocked"
+      else { status = "unknown"; sha = ""; reason = "" }
+      if (!/^[0-9a-f]{7,64}$/.test(sha) && status !== "unknown") sha = ""
+      root.setGitStatus(id, status, sha, reason.slice(0, 256))
+      gitCheckProc.output = ""
+      gitCheckProc.overflow = false
+      gitCheckProc.timedOut = false
+      root.gitCheckNext()
+    }
+  }
+
+  Timer {
+    id: gitRestartTimer
+    interval: 100
+    repeat: false
+    onTriggered: {
+      if (!gitCheckProc.running) {
+        root.gitPending = false
+        root.gitCheckNext()
+      } else {
+        gitRestartTimer.restart()
+      }
+    }
+  }
+
+  Timer {
+    id: gitTimeout
+    interval: 15000
+    repeat: false
+    onTriggered: {
+      if (!gitCheckProc.running) return
+      gitCheckProc.timedOut = true
+      gitCheckProc.signal(15)
+      gitCheckProc.running = false
+      if (root.gitCurrentId) {
+        root.setGitStatus(root.gitCurrentId, "unknown", "", "")
+        root.gitCurrentId = ""
+      }
+      gitRestartTimer.restart()
     }
   }
 
@@ -222,48 +513,83 @@ function fetchAll() {
     return root.busy[id] === true
   }
 
-  function runPluginsCommand(command, successMsg, failMsg, idOverride) {
-    var id = idOverride !== undefined ? idOverride : command[command.length - 1]
-    if (!id || root.rowBusy(id)) return
-    if (root.allPlugins.length > 0 && root.rowById(id)) {
-      var entry = root.rowById(id)
-      if (entry.isBar) return
-      root.setBusy(id, true)
-    }
-    actionProc.command = command
-    actionProc._successMsg = successMsg
-    actionProc._failMsg = failMsg
+  function clearPendingRemoval() {
+    root.pendingRemovalId = ""
+    root.pendingRemovalName = ""
+  }
+
+  function runPluginsCommand(command, successMsg, failMsg, idOverride, needsGitRecheck) {
+    if (!Array.isArray(command) || command.length === 0 || command.length > 8) return
+    var id = idOverride !== undefined ? String(idOverride) : String(command[command.length - 1])
+    if (!PM.validPluginId(id) || id === PM.SELF_ID || root.actionRunning || root.rowBusy(id)) return
+    var entry = root.rowById(id)
+    if (!entry || entry.isBar || root.loading) return
+    var bounded = root.boundedCommand(command, 65536, 120)
+    if (bounded.length === 0) return
+    root.setBusy(id, true)
+    root.lastActionId = id
+    root.lastActionNeedsGitRecheck = needsGitRecheck === true
+    actionProc.generation = ++root.actionGeneration
+    actionProc.timedOut = false
+    actionProc.command = bounded
+    actionProc._successMsg = String(successMsg || "").slice(0, 256)
+    actionProc._failMsg = String(failMsg || "").slice(0, 256)
+    root.actionRunning = true
     actionProc.running = true
+    actionTimeout.restart()
   }
 
   function toggleRow(row) {
-    if (!row || row.isBar || root.rowBusy(row.id) || root.busy["*"]) return
-    if (row.enabled) root.runPluginsCommand(PM.disableCommand(row.id), "Disabled " + row.name, "Failed to disable " + row.name)
-    else root.runPluginsCommand(PM.enableCommand(row.id), "Enabled " + row.name, "Failed to enable " + row.name)
+    if (!row || !row.canToggle || row.enabledState === "unknown" || root.rowBusy(row.id) || root.busy["*"]) return
+    if (row.enabled) root.runPluginsCommand(PM.disableCommand(row.id), "Disabled " + row.name, "Failed to disable " + row.name, row.id, false)
+    else root.runPluginsCommand(PM.enableCommand(row.id), "Enabled " + row.name, "Failed to enable " + row.name, row.id, false)
   }
 
   function removeRow(row) {
     if (!row || !row.canRemove || root.rowBusy(row.id) || root.busy["*"]) return
-    root.runPluginsCommand(PM.removeCommand(row.id), "Removed " + row.name, "Failed to remove " + row.name, row.id)
+    if (root.pendingRemovalId !== row.id) {
+      root.pendingRemovalId = row.id
+      root.pendingRemovalName = row.name
+      root.setNotice("Click uninstall again to remove " + row.name)
+      return
+    }
+    root.clearPendingRemoval()
+    root.runPluginsCommand(PM.removeCommand(row.id), "Removed " + row.name, "Failed to remove " + row.name, row.id, true)
   }
 
   function updateRow(row) {
     if (!row || row.firstParty || root.rowBusy(row.id) || root.busy["*"]) return
+    if (root.gitState(row.id) !== "stale") return
     root.clearGitStatus(row.id)
-    root.runPluginsCommand(PM.updateCommand(row.id), "Updated " + row.name, "Failed to update " + row.name, row.id)
+    root.runPluginsCommand(
+      PM.updateCommand(row.id, root.pluginDir + "/git_update.py", row.sourceDir),
+      "Updated " + row.name,
+      "Failed to update " + row.name,
+      row.id,
+      true
+    )
   }
 
   function updateAll() {
-    if (root.busy["*"]) return
+    if (root.actionRunning || root.updatesAvailable <= 0) return
     for (var id in root.busy) if (root.busy[id] === true) return
+    var updateCommand = PM.updateAllCommand(root.home, root.pluginDir + "/git_update.py")
+    var bounded = root.boundedCommand(updateCommand, 65536, 120)
+    if (bounded.length === 0) return
     root.setBusy("*", true)
+    root.lastActionId = "*"
+    root.lastActionNeedsGitRecheck = true
     root.gitInfo = {}
-    root.gitChecks = []
-    root.gitCurrentId = ""
-    actionProc.command = PM.updateAllCommand()
+    root.updatesAvailable = 0
+    root.stopGitChecks()
+    actionProc.generation = ++root.actionGeneration
+    actionProc.timedOut = false
+    actionProc.command = bounded
     actionProc._successMsg = "Updated all plugins"
     actionProc._failMsg = "Failed to update some plugins"
+    root.actionRunning = true
     actionProc.running = true
+    actionTimeout.restart()
   }
 
   function updateCursor() {
@@ -282,31 +608,66 @@ function fetchAll() {
   }
 
   function setNotice(text) {
-    root.notice = text
+    root.notice = String(text || "").slice(0, 512)
     noticeTimer.restart()
   }
 
   Timer {
     id: noticeTimer
     interval: 6000
-    onTriggered: root.notice = ""
+    onTriggered: {
+      root.notice = ""
+      root.clearPendingRemoval()
+    }
+  }
+
+  function completeAction(success) {
+    if (!root.actionRunning) return
+    actionTimeout.stop()
+    root.actionRunning = false
+    root.finishAction(success === true)
   }
 
   Process {
     id: actionProc
+    property int generation: -1
+    property bool timedOut: false
     property string _successMsg: ""
     property string _failMsg: ""
-    // The exit code is the ground truth — an action may print nothing yet
-    // still fail (offline, local edits blocking a fast-forward, invalid repo).
+    command: []
+    stdout: SplitParser {}
+    stderr: SplitParser {}
     onExited: function(exitCode) {
-      root.finishAction(exitCode === 0 ? root.actionProc._successMsg : root.actionProc._failMsg)
+      if (actionProc.generation !== root.actionGeneration) return
+      completeAction(exitCode === 0 && !actionProc.timedOut)
+      actionProc.timedOut = false
     }
   }
 
-  function finishAction(msg) {
+  Timer {
+    id: actionTimeout
+    interval: 120000
+    repeat: false
+    onTriggered: {
+      if (!actionProc.running) return
+      actionProc.timedOut = true
+      actionProc.signal(15)
+      actionProc.running = false
+      actionProc.generation = -1
+      completeAction(false)
+    }
+  }
+
+  function finishAction(success) {
     root.busy = {}
-    root.setNotice(msg)
-    Qt.callLater(function() { root.refresh() })
+    var touched = root.lastActionId
+    var recheck = root.lastActionNeedsGitRecheck && success
+    root.lastActionId = ""
+    root.lastActionNeedsGitRecheck = false
+    if (recheck && touched && touched !== "*") root.clearGitStatus(touched)
+    var message = success ? actionProc._successMsg : actionProc._failMsg
+    root.setNotice(message || (success ? "Action completed" : "Action failed"))
+    Qt.callLater(function() { root.softRefresh() })
   }
 
   // ---- Keyboard cursor ---------------------------------------------------
@@ -343,12 +704,17 @@ function fetchAll() {
     if (row) root.configureRow(row)
   }
 
-  // ---- Lifecycle ---------------------------------------------------------
   onOpenedChanged: {
-    if (opened && root.allPlugins.length === 0) root.refresh()
+    if (!opened) {
+      root.clearPendingRemoval()
+      return
+    }
+    if (!root.loading && root.allPlugins.length === 0) root.softRefresh()
   }
 
-  Component.onCompleted: root.refresh()
+  onSettingsChanged: root.queueRefresh()
+
+  Component.onCompleted: root.softRefresh()
 
   // ---- Bar button --------------------------------------------------------
   BarIconButton {
@@ -357,8 +723,8 @@ function fetchAll() {
     bar: root.bar
     text: root.iconText
     active: root.opened
-    tooltipText: root.updateCount() > 0
-      ? "Plugin Manager — " + root.updateCount() + (root.updateCount() > 1 ? " updates" : " update") + " available"
+    tooltipText: root.updatesAvailable > 0
+      ? "Plugin Manager — " + root.updatesAvailable + (root.updatesAvailable > 1 ? " updates" : " update") + " available"
       : "Plugin Manager"
     onPressed: function(mouseButton) {
       if (mouseButton === Qt.RightButton) root.close()
@@ -369,7 +735,7 @@ function fetchAll() {
   // Update notifier: an accent dot on the bar button whenever any git-managed
   // plugin has a newer commit on its origin.
   Rectangle {
-    visible: root.updateCount() > 0
+    visible: root.updatesAvailable > 0
     anchors.right: button.right
     anchors.top: button.top
     anchors.rightMargin: 1
@@ -417,7 +783,9 @@ function fetchAll() {
         if (c === "/") searchField.forceActiveFocus()
         else if (c === "c" || c === "C") root.configureCursor()
         else if (c === "m" || c === "M") root.openMarketplace()
-        else if (c === "r" || c === "R") root.refresh()
+         else if (c === "r" || c === "R") {
+           if (!root.loading && !root.actionRunning) root.refresh()
+         }
         else if (c === "u" || c === "U") root.updateCursor()
       }
 
@@ -483,9 +851,9 @@ function fetchAll() {
 
             PanelActionButton {
               id: updateAllBtn
-              visible: root.updateCount() > 0
+              visible: root.updatesAvailable > 0
               iconText: "\uf01e"
-              tooltipText: "Update all plugins (" + root.updateCount() + " available)"
+              tooltipText: "Update all plugins (" + root.updatesAvailable + " available)"
               foreground: Color.accent
               hoverColor: Color.accent
               fontFamily: root.bar.fontFamily
@@ -494,11 +862,24 @@ function fetchAll() {
             }
 
             PanelActionButton {
+              id: checkUpdatesBtn
+              iconText: "\uf1e0"
+              tooltipText: "Check for plugin updates"
+              foreground: root.bar.foreground
+              hoverColor: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              enabled: !root.loading && !root.gitChecksRequested
+              onClicked: root.requestGitChecks()
+            }
+
+            PanelActionButton {
+              id: refreshBtn
               iconText: "\uf021"
               tooltipText: "Refresh"
               foreground: root.bar.foreground
               hoverColor: root.bar.foreground
               fontFamily: root.bar.fontFamily
+              enabled: !root.loading && !root.actionRunning
               onClicked: root.refresh()
             }
 
@@ -521,9 +902,9 @@ function fetchAll() {
           foreground: root.bar.foreground
           accent: root.bar.foreground
           text: root.query
-          onTextChanged: {
-            root.query = text
-            root.rows = PM.applyFilter(root.allPlugins, root.query)
+           onTextChanged: {
+             root.query = String(text || "").slice(0, 256)
+             root.rows = PM.applyFilter(root.allPlugins, root.query)
             root.cursorIndex = -1
           }
         }
@@ -552,7 +933,7 @@ function fetchAll() {
             clip: true
             model: root.rows
 
-delegate: Item {
+            delegate: Item {
               id: rowItem
               required property var modelData
               required property int index
@@ -693,7 +1074,9 @@ delegate: Item {
                     id: removeBtn
                     visible: row.canRemove
                     iconText: "\uf1f8"
-                    tooltipText: "Uninstall " + row.name
+                     tooltipText: root.pendingRemovalId === row.id
+                       ? "Confirm uninstall " + row.name
+                       : "Uninstall " + row.name
                     foreground: root.bar.foreground
                     hoverColor: root.bar.urgent
                     fontFamily: root.bar.fontFamily
@@ -760,23 +1143,23 @@ delegate: Item {
 
           Button {
             id: updateAllFooter
-            text: root.updateCount() > 0
-              ? (root.updateCount() > 1
-                  ? "Update all (" + root.updateCount() + ")"
+            text: root.updatesAvailable > 0
+              ? (root.updatesAvailable > 1
+                  ? "Update all (" + root.updatesAvailable + ")"
                   : "Update all")
               : "Up to date"
             iconText: "\uf01e"
-            foreground: root.updateCount() > 0 ? Color.accent : Qt.darker(root.bar.foreground, 1.4)
+            foreground: root.updatesAvailable > 0 ? Color.accent : Qt.darker(root.bar.foreground, 1.4)
             accent: Color.accent
             iconSize: Style.font.caption
             fontSize: Style.font.caption
             fontFamily: root.bar.fontFamily
             horizontalPadding: Style.space(10)
             verticalPadding: Style.space(4)
-            tooltipText: root.updateCount() > 0
-              ? "Update all " + root.updateCount() + " stale plugin" + (root.updateCount() > 1 ? "s" : "")
+            tooltipText: root.updatesAvailable > 0
+              ? "Update all " + root.updatesAvailable + " stale plugin" + (root.updatesAvailable > 1 ? "s" : "")
               : "All plugins are up to date"
-            enabled: root.updateCount() > 0 && !root.busy["*"] && !root.loading
+            enabled: root.updatesAvailable > 0 && !root.busy["*"] && !root.loading
             iconSpinning: root.busy["*"] === true
             onClicked: root.updateAll()
           }
@@ -800,8 +1183,9 @@ delegate: Item {
     var s = PM.summary(root.allPlugins)
     var part = s.installed + " plugins"
     var state = s.enabled + " enabled"
+    if (s.unknown > 0) state += " · " + s.unknown + " unknown"
     if (root.query !== "") part = root.rows.length + " of " + s.installed
-    var up = root.updateCount()
+    var up = root.updatesAvailable
     if (up > 0) state = up + " update" + (up > 1 ? "s" : "") + " available"
     return (part + "  ·  " + state).toUpperCase()
   }
@@ -813,15 +1197,40 @@ delegate: Item {
     else parts.push("third-party")
     if (row.hasSchema) parts.push("configurable")
     if (row.clonedFrom) parts.push("clone of " + row.clonedFrom)
-    if (!row.enabled) parts.push("disabled")
+    if (row.enabledState === "unknown") parts.push("state unknown")
+    else if (!row.enabled) parts.push("disabled")
     var g = root.gitInfo[row.id]
     if (g) {
       if (g.status === "stale") parts.push("update available")
       else if (g.status === "blocked") parts.push("no update · " + (g.reason || "has local edits"))
+      else if (g.status === "unknown") parts.push("update state unknown")
       else if (g.status === "checking") parts.push("checking…")
       if (g.sha) parts.push("@" + g.sha)
     }
     if (root.rowBusy(row.id)) parts.push("working…")
     return parts.join("  ·  ")
+  }
+
+  Component.onDestruction: {
+    root.dataGeneration++
+    root.listGeneration = -1
+    root.catalogGeneration = -1
+    root.gitGeneration++
+    root.gitPending = true
+    root.gitChecks = []
+    root.gitCurrentId = ""
+    root.actionGeneration++
+    root.actionRunning = false
+    root.busy = ({})
+    listProc.running = false
+    catalogProc.running = false
+    gitCheckProc.running = false
+    actionProc.running = false
+    dataTimeout.stop()
+    gitTimeout.stop()
+    actionTimeout.stop()
+    dataRestartTimer.stop()
+    gitRestartTimer.stop()
+    noticeTimer.stop()
   }
 }

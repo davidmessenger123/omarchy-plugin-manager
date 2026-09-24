@@ -18,19 +18,16 @@ moves it afterwards if you change your mind.
 - **Configure** plugins that have editable settings:
   - First-party bar widgets open `~/.config/omarchy/shell.json`
   - Third-party plugins open their plugin folder for editing
-- **Update notifier + update buttons** for git-managed third-party plugins:
-  - On load (and on refresh) each git-backed plugin is compared against its
-    `origin` (a `git fetch` plus a fast-forward check, so the verdict matches
-    what `omarchy plugin update` can actually do); a cleanly updatable
-    checkout is marked "update available"
+- **Explicit, bounded update checks** for git-managed third-party plugins:
+  - The **Check for updates** action explicitly opts into comparing git-backed plugins against `origin`; it performs a bounded, timed fetch and fast-forward check, and a cleanly updatable checkout is marked "update available"
   - An accent dot appears on the bar button, a summary line in the panel
     header ("N updates available"), and **Update all** buttons in the header
     and footer, plus an **Update** button on each stale row
   - When a checkout cannot fast-forward — uncommitted local changes or
     unpublished commits — no update is offered and the row meta says why
     ("no update · local changes" / "no update · unpublished commits")
-  - Row actions share one update process, so per-row actions and "update all"
-    can never run over each other
+  - Row actions share one bounded update process, so per-row actions and "update all" cannot run over each other
+  - Git checks and updates use a system-owned Git binary, reject repository-controlled config/hooks, and fetch only a validated direct HTTPS remote
   - Row meta shows the installed commit (`@abc1234`), and in-menu notices
     reflect the command's real exit code (success vs failed), so you can
     verify that an update actually landed
@@ -47,17 +44,22 @@ moves it afterwards if you change your mind.
 | `u`      | Update selected      |
 | `Del`    | Uninstall selected   |
 | `m`      | Open marketplace     |
-| `r`      | Refresh              |
+| `r`      | Refresh installed/catalog data |
+| update button | Explicitly check git updates |
 | `Esc`    | Close                |
 
 ## Files
 
 - `PluginManager.qml` — bar widget + popup panel
 - `PluginManager.js` — data model (lists plugins via the Omarchy CLI)
+- `git_check.py` / `git_update.py` — isolated Git status/update helpers
+- `bounded_exec.py` — bounded fixed-command bridge
 - `manifest.json` — plugin manifest
 
-The widget shells out to `omarchy plugin list --json`, `omarchy-plugin-catalog`,
-and the `omarchy plugin …` commands, so it always reflects reality.
+The widget uses fixed system command paths and bounded bridges for catalog
+reads and actions. Git-backed updates run through `git_update.py`, which
+validates the origin URL and disables repository-controlled Git configuration;
+the regular `omarchy` CLI remains available for non-Git operations.
 
 To update git-managed plugins from a terminal instead:
 `omarchy plugin update <id>` (or `omarchy plugin update` for all of them).
