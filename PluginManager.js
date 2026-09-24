@@ -61,6 +61,7 @@ function validExternalCommand(value) {
   if (value.some(function(item) { return typeof item !== "string" || item.length > 4096 || /[\x00-\x1f\x7f]/.test(item) })) return false
   if (value[0] === OMARCHY_PATH) {
     if (value.length === 4 && value[1] === "plugin" && value[2] === "list" && value[3] === "--json") return true
+    if (value.length === 4 && value[1] === "plugin" && value[2] === "update" && value[3] === "--yes") return true
     if (value.length === 4 && value[1] === "plugin" && (value[2] === "enable" || value[2] === "disable") && validPluginId(value[3])) return true
     if (value.length === 5 && value[1] === "plugin" && value[2] === "remove" && validPluginId(value[3]) && value[4] === "--yes") return true
     return false
@@ -279,10 +280,8 @@ function updateCommand(id, helperPath, dir) {
     : []
 }
 
-function updateAllCommand(home, helperPath) {
-  return validPath(home) && validHelperPath(helperPath)
-    ? ["/usr/bin/python3", "-I", String(helperPath), "all"]
-    : []
+function updateAllCommand() {
+  return [OMARCHY_PATH, "plugin", "update", "--yes"]
 }
 
 function configureCommand(row, home) {

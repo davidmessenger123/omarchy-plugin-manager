@@ -26,11 +26,11 @@ moves it afterwards if you change your mind.
   - When a checkout cannot fast-forward — uncommitted local changes or
     unpublished commits — no update is offered and the row meta says why
     ("no update · local changes" / "no update · unpublished commits")
-  - Row actions share one bounded update process, so per-row actions and "update all" cannot run over each other
-  - Git checks and updates use a system-owned Git binary, reject repository-controlled config/hooks, and fetch only a validated direct HTTPS remote
-  - Row meta shows the installed commit (`@abc1234`), and in-menu notices
-    reflect the command's real exit code (success vs failed), so you can
-    verify that an update actually landed
+  - Per-row updates use a bounded process; **Update all** launches `omarchy plugin update --yes` independently so the shell reload triggered by the first updated plugin cannot interrupt the remaining updates
+  - Git checks and per-row updates use a system-owned Git binary, reject repository-controlled config/hooks, and fetch only a validated direct HTTPS remote
+  - Row meta shows the installed commit (`@abc1234`), and per-row in-menu
+    notices reflect the command's real exit code (success vs failed), so you
+    can verify that an update actually landed
 - **Marketplace** shortcut to https://plugins.omarchy.org/
 
 ## Keys
@@ -57,9 +57,10 @@ moves it afterwards if you change your mind.
 - `manifest.json` — plugin manifest
 
 The widget uses fixed system command paths and bounded bridges for catalog
-reads and actions. Git-backed updates run through `git_update.py`, which
-validates the origin URL and disables repository-controlled Git configuration;
-the regular `omarchy` CLI remains available for non-Git operations.
+reads and per-row actions. Git-backed per-row updates run through
+`git_update.py`, which validates the origin URL and disables
+repository-controlled Git configuration. **Update all** delegates to
+`omarchy plugin update --yes`.
 
 To update git-managed plugins from a terminal instead:
 `omarchy plugin update <id>` (or `omarchy plugin update` for all of them).

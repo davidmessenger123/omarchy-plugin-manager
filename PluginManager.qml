@@ -573,23 +573,14 @@ Panel {
   function updateAll() {
     if (root.actionRunning || root.updatesAvailable <= 0) return
     for (var id in root.busy) if (root.busy[id] === true) return
-    var updateCommand = PM.updateAllCommand(root.home, root.pluginDir + "/git_update.py")
-    var bounded = root.boundedCommand(updateCommand, 65536, 120)
-    if (bounded.length === 0) return
-    root.setBusy("*", true)
-    root.lastActionId = "*"
-    root.lastActionNeedsGitRecheck = true
+    var updateCommand = PM.updateAllCommand()
+    if (!PM.validExternalCommand(updateCommand)) return
+    root.gitChecksRequested = false
     root.gitInfo = {}
     root.updatesAvailable = 0
     root.stopGitChecks()
-    actionProc.generation = ++root.actionGeneration
-    actionProc.timedOut = false
-    actionProc.command = bounded
-    actionProc._successMsg = "Updated all plugins"
-    actionProc._failMsg = "Failed to update some plugins"
-    root.actionRunning = true
-    actionProc.running = true
-    actionTimeout.restart()
+    root.setNotice("Updating all plugins…")
+    Quickshell.execDetached(updateCommand)
   }
 
   function updateCursor() {
