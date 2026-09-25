@@ -21,7 +21,7 @@ HEX_RE = re.compile(r"^[0-9a-f]{40,64}$")
 GIT_DIR_RE = re.compile(r"^gitdir:\s*(.+?)\s*$", re.IGNORECASE)
 UNSAFE_KEYS = {
     "hookspath", "sshcommand", "askpass", "fsmonitor", "pager", "editor",
-    "alternaterefscommand", "attributesfile", "worktree", "bare", "gitproxy",
+    "alternaterefscommand", "attributesfile", "worktree", "gitproxy",
 }
 UNSAFE_SECTIONS = {"filter", "merge", "diff", "mergetool", "submodule"}
 ISOLATED_CONFIG = (
@@ -248,6 +248,8 @@ def origin_url(path):
         if not re.fullmatch(r"[A-Za-z0-9-]+", key):
             continue
         _validate_config_section(section, subsection, key)
+        if section == "core" and key == "bare" and _decode_value(value).lower() != "false":
+            raise GitConfigError("repository-controlled Git configuration is not allowed")
         if section == "remote" and subsection.lower() == "origin" and key == "url":
             urls.append(_decode_value(value))
     if len(urls) != 1:

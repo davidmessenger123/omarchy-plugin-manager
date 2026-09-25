@@ -54,6 +54,33 @@ class GitCheckTests(unittest.TestCase):
             with self.assertRaises(git_check.GitConfigError):
                 git_check.origin_url(directory)
 
+    def test_accepts_standard_non_bare_repository_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            os.mkdir(os.path.join(directory, ".git"))
+            config = os.path.join(directory, ".git", "config")
+            with open(config, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "[core]\n"
+                    "\trepositoryformatversion = 0\n"
+                    "\tfilemode = true\n"
+                    "\tbare = false\n"
+                    "\tlogallrefupdates = true\n"
+                    "[remote \"origin\"]\n"
+                    "\turl = https://github.com/owner/repository.git\n"
+                    "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+                    "[branch \"main\"]\n"
+                    "\tremote = origin\n"
+                    "\tmerge = refs/heads/main\n"
+                )
+            self.assertEqual(
+                git_check.origin_url(directory),
+                "https://github.com/owner/repository.git",
+            )
+            with open(config, "w", encoding="utf-8") as handle:
+                handle.write("[core]\n\tbare = true\n")
+            with self.assertRaises(git_check.GitConfigError):
+                git_check.origin_url(directory)
+
     def test_fetch_uses_validated_url_instead_of_repository_remote_name(self):
         with tempfile.TemporaryDirectory() as directory:
             calls = []
